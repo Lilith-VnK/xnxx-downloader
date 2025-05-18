@@ -37,7 +37,7 @@ def check_update(repo_url, local_path):
     except Exception as e:
         print(f"[ERROR] Kesalahan saat memeriksa pembaruan: {str(e)}")
         
-GITHUB_SCRIPT_URL = "https://raw.githubusercontent.com/username/repo/main/xnxx.py"
+GITHUB_SCRIPT_URL = "https://raw.githubusercontent.com/Lilith-VnK/xnxx-downloader/refs/heads/main/start.py"
 LOCAL_SCRIPT_PATH = sys.argv[0]
 
 check_update(GITHUB_SCRIPT_URL, LOCAL_SCRIPT_PATH)
