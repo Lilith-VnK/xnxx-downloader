@@ -54,6 +54,23 @@ python xnxx.py [URL] --download
 python xnxx.py https://www.xnxx.com/video-123456789/987654321 --download
 ```
 
+## 🔹 Advanced Usage
+
+| Opsi                  | Deskripsi                                      |
+|-----------------------|------------------------------------------------|
+| `--download`          | Mengunduh video                                |
+| `--quality [low/high/hls]` | Pilih kualitas video                        |
+| `--batch [file.txt]`  | Baca daftar URL dari file teks                 |
+| `--output [folder]`   | Simpan video di folder khusus                  |
+| `--delay [detik]`     | Tambahkan delay antar permintaan                |
+| `--download-thumb`    | Unduh thumbnail video                           |
+| `--convert [format]`  | Konversi video ke format lain (misalnya `--convert mp3`) |
+| `--notify`            | Notifikasi saat unduhan selesai (Termux)      |
+
+### Contoh:
+```bash
+python xnxx.py https://www.xnxx.com/video-123456789/ --download --quality high --output videos --notify --convert mp3 --download-thumb
+
 ## 📁 Batch Mode
 
 Buat file teks dengan daftar URL, misalnya `urls.txt`:
