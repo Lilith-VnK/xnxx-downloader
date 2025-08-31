@@ -75,16 +75,23 @@ python xnxx.py https://www.xnxx.com/video-123456789/ --download --quality high -
 ## 📁 Batch Mode
 
 Buat file teks dengan daftar URL, misalnya `urls.txt`:
-
 ```
+
 https://www.xnxx.com/video-123456789/
 https://www.xnxx.com/video-987654321/
-```
 
 Lalu jalankan:
 
+```
+python start.py --batch urls.txt --download --output downloads --delay 5
+```
+
+## Positif Network
+
+Jika kalian mengalami positif network/terblokir oleh ISP anda, gunakan perintah
+
 ```bash
-python xnxx.py --batch urls.txt --download --output downloads --delay 5
+python3 start.py https://xnxx.com/111111/example --download --dns 1.1.1.1
 ```
 
 ## 🔁 Auto Update
