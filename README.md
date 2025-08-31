@@ -59,6 +59,7 @@ python xnxx.py https://www.xnxx.com/video-123456789/987654321 --download
 | Opsi                  | Deskripsi                                      |
 |-----------------------|------------------------------------------------|
 | `--download`          | Mengunduh video                                |
+| `--dns`          | Mengubah DNS                                |
 | `--quality [low/high/hls]` | Pilih kualitas video                        |
 | `--batch [file.txt]`  | Baca daftar URL dari file teks                 |
 | `--output [folder]`   | Simpan video di folder khusus                  |
