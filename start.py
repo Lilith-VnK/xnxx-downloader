@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
 import sys
 import os
 import time
@@ -10,13 +13,156 @@ from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 from tqdm import tqdm
 import hashlib
+import urllib3
+import socket
 from urllib.parse import urljoin, urlparse
 
-# === Auto Update ===
+# === Tambahkan import untuk dnspython ===
+try:
+    import dns.resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+    print("[WARNING] Pustaka 'dnspython' tidak ditemukan. Fitur resolver DNS dinonaktifkan.")
+    print("          Untuk mengaktifkannya, instal dengan: pip install dnspython")
+
+# === Retry ===
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+# === Helper: DNS Resolve (pakai dnspython jika tersedia, fallback ke socket) ===
+def resolve_host_list(host, dns_server=None, timeout=5):
+    ips = []
+    if DNS_AVAILABLE and dns_server:
+        try:
+            resolver = dns.resolver.Resolver(configure=False)
+            # dns_server bisa berupa string "1.1.1.1" atau "1.1.1.1,8.8.8.8"
+            if isinstance(dns_server, str) and ',' in dns_server:
+                resolver.nameservers = [s.strip() for s in dns_server.split(',') if s.strip()]
+            elif isinstance(dns_server, (list, tuple)):
+                resolver.nameservers = list(dns_server)
+            else:
+                resolver.nameservers = [dns_server]
+            resolver.timeout = timeout
+            resolver.lifetime = timeout
+            answers = resolver.resolve(host, 'A')
+            for a in answers:
+                ips.append(a.to_text())
+            if ips:
+                return ips
+        except Exception as e:
+            # fallthrough to socket
+            print(f"[WARNING] DNS resolver ({dns_server}) gagal untuk {host}: {e}")
+
+    # Fallback ke system resolver (socket)
+    try:
+        for res in socket.getaddrinfo(host, None):
+            ip = res[4][0]
+            if ip not in ips:
+                ips.append(ip)
+        return ips
+    except Exception as e:
+        print(f"[WARNING] Socket resolver gagal untuk {host}: {e}")
+        return []
+
+# === Custom HTTP Adapter untuk backward compatibility ===
+class DNSHTTPAdapter(HTTPAdapter):
+    def __init__(self, dns_server=None, *args, **kwargs):
+        self.dns_server = dns_server
+        super().__init__(*args, **kwargs)
+
+    def add_headers(self, request, **kwargs):
+        # jika request sudah memiliki header Host, biarkan saja
+        return super().add_headers(request, **kwargs)
+
+# === fungsi sesi untuk menyertakan DNS ===
+def get_session_with_proxy(proxy_url=None, no_verify_ssl=False, dns_server=None, max_retries=3):
+
+    session = requests.Session()
+
+    # Proxies
+    if proxy_url:
+        session.proxies = {
+            'http': proxy_url,
+            'https': proxy_url
+        }
+
+    # Set default verify flag on session (requests will still accept per-call override)
+    session.verify = not no_verify_ssl
+    if no_verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # Mount retry-enabled adapter
+    retry = Retry(total=max_retries, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    # If no dns_server provided or dnspython absent, do not patch request (use system resolver)
+    if not dns_server:
+        return session
+
+    # Patch session.request to perform DNS resolve + Host injection per-request
+    original_request = session.request
+
+    def patched_request(method, url, *args, **kwargs):
+        try:
+            parsed = urlparse(url)
+            orig_host = parsed.hostname
+            if orig_host:
+                # Only intercept when hostname is not an IP literal
+                is_ip = False
+                try:
+                    socket.inet_aton(orig_host)
+                    is_ip = True
+                except Exception:
+                    is_ip = False
+
+                if not is_ip:
+                    ips = resolve_host_list(orig_host, dns_server=dns_server)
+                    if ips:
+                        ip = ips[0]
+                        # rebuild netloc with possible port
+                        new_netloc = ip
+                        if parsed.port:
+                            new_netloc = f"{ip}:{parsed.port}"
+
+                        # Replace first occurrence of scheme://hostname with scheme://new_netloc
+                        scheme_prefix = f"{parsed.scheme}://{orig_host}"
+                        new_url = url.replace(scheme_prefix, f"{parsed.scheme}://{new_netloc}", 1)
+
+                        # Prepare headers
+                        headers = kwargs.get('headers', {})
+                        # preserve existing Host header if present (but override with orig_host)
+                        headers['Host'] = orig_host
+                        kwargs['headers'] = headers
+
+                        # Because we are requesting IP while TLS expects hostname, default to disabling verify
+                        # unless user explicitly set verify in kwargs; we prefer to allow caller to set verify param.
+                        if 'verify' not in kwargs:
+                            kwargs['verify'] = not no_verify_ssl  # follow session setting
+
+                        # Update url to new_url
+                        url = new_url
+                        if kwargs.get('stream') is None:
+                            # nothing special
+                            pass
+        except Exception as e:
+            # If anything goes wrong here, fallback to original URL without DNS forcing
+            print(f"[WARNING] Gagal memaksa resolve untuk {url}: {e}")
+
+        return original_request(method, url, *args, **kwargs)
+
+    session.request = patched_request
+    return session
+
+# === Auto Update dengan Konfirmasi ===
 def check_update(repo_url, local_path):
     try:
         print("[INFO] Memeriksa pembaruan skrip...")
-        response = requests.get(repo_url)
+        # Buat sesi tanpa DNS khusus untuk auto-update (pakai system resolver)
+        session = get_session_with_proxy()
+        response = session.get(repo_url, timeout=15)
         if response.status_code == 200:
             remote_sha = hashlib.sha256(response.content).hexdigest()
             try:
@@ -25,21 +171,34 @@ def check_update(repo_url, local_path):
             except FileNotFoundError:
                 local_sha = ""
             if remote_sha != local_sha:
-                print("[INFO] Pembaruan tersedia. Mengunduh versi terbaru...")
-                with open(local_path, "wb") as f:
-                    f.write(response.content)
-                print("[INFO] Skrip berhasil diperbarui. Silakan jalankan ulang.")
-                sys.exit(0)
+                print("[INFO] Pembaruan tersedia.")
+                # Meminta konfirmasi pengguna
+                while True:
+                    try:
+                        choice = input("Apakah Anda ingin mengunduh dan memasang pembaruan? (y/n): ").lower().strip()
+                        if choice in ['y', 'yes', 'ya']:
+                            print("[INFO] Mengunduh versi terbaru...")
+                            with open(local_path, "wb") as f:
+                                f.write(response.content)
+                            print("[INFO] Skrip berhasil diperbarui.")
+                            # Jalankan ulang skrip
+                            print("[INFO] Menjalankan ulang skrip yang telah diperbarui...")
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                            break  # Tidak akan pernah tercapai karena execv
+                        elif choice in ['n', 'no', 'tidak']:
+                            print("[INFO] Melewati pembaruan. Menjalankan skrip versi saat ini.")
+                            break
+                        else:
+                            print("[WARNING] Masukkan tidak valid. Silakan jawab dengan 'y' atau 'n'.")
+                    except KeyboardInterrupt:
+                        print("\n[INFO] Pembaruan dibatalkan oleh pengguna. Menjalankan skrip versi saat ini.")
+                        break
             else:
                 print("[INFO] Skrip sudah versi terbaru.")
         else:
             print("[ERROR] Gagal memeriksa pembaruan.")
     except Exception as e:
         print(f"[ERROR] Kesalahan saat memeriksa pembaruan: {str(e)}")
-
-GITHUB_SCRIPT_URL = "https://raw.githubusercontent.com/Lilith-VnK/xnxx-downloader/refs/heads/main/start.py"
-LOCAL_SCRIPT_PATH = sys.argv[0]
-check_update(GITHUB_SCRIPT_URL, LOCAL_SCRIPT_PATH)
 
 # === Parsing Argumen ===
 def parse_args():
@@ -48,10 +207,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Contoh penggunaan:
-  python xnxx_downloader.py https://www.xnxx.com/video-abc123/judul_video 
-  python xnxx_downloader.py https://www.xnxx.com/video-abc123/judul_video  --download --quality high
+  python xnxx_downloader.py https://www.xnxx.com/video-abc123/judul_video      
+  python xnxx_downloader.py https://www.xnxx.com/video-abc123/judul_video     --download --quality high
   python xnxx_downloader.py --batch urls.txt --download --output ./videos
-  python xnxx_downloader.py --url xnxx.com/milf --how-much 3 --download --quality high
         """
     )
     parser.add_argument("url", nargs="?", help="URL video xnxx.com")
@@ -67,9 +225,13 @@ Contoh penggunaan:
     parser.add_argument("--proxy", help="Gunakan proxy (format: http://host:port)")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout untuk request (detik)")
     parser.add_argument("--max-retries", type=int, default=3, help="Jumlah maksimal retry")
-    # Argumen baru untuk auto-download dari halaman kategori/pencarian
-    parser.add_argument("--url", "-u", dest="search_url", help="URL xnxx.com untuk mencari video (contoh: xnxx.com/milf)")
-    parser.add_argument("--how-much", "-H", type=int, default=1, help="Jumlah video teratas yang akan diunduh")
+    # Opsi untuk menangani SSL
+    parser.add_argument("--no-verify-ssl", action="store_true", help="Nonaktifkan verifikasi sertifikat SSL (tidak aman)")
+    # === Opsi DNS Resolver ===
+    if DNS_AVAILABLE:
+        parser.add_argument("--dns", help="Gunakan DNS khusus untuk resolusi (format: IP_Address atau '1.1.1.1,8.8.8.8')")
+    # === Opsi Debug ===
+    parser.add_argument("--debug", action="store_true", help="Aktifkan logging debug")
     return parser.parse_args()
 
 def show_disclaimer():
@@ -89,31 +251,21 @@ def show_disclaimer():
         print("\nKeluar: Dibatalkan oleh pengguna.")
         sys.exit(1)
 
-def get_session_with_proxy(proxy_url=None):
-    session = requests.Session()
-    if proxy_url:
-        session.proxies = {
-            'http': proxy_url,
-            'https': proxy_url
-        }
-    return session
-
-def download_video(url, headers, filename, output_dir, resume=False, timeout=30, max_retries=3, proxy=None):
+def download_video(url, headers, filename, output_dir, resume=False, timeout=30, max_retries=3, proxy=None, no_verify_ssl=False, dns_server=None):
     full_path = os.path.join(output_dir, filename)
     downloaded = 0
     mode = 'ab' if resume and os.path.exists(full_path) else 'wb'
 
     try:
-        session = get_session_with_proxy(proxy)
-        adapter = requests.adapters.HTTPAdapter(max_retries=max_retries)
-        session.mount('https://', adapter)
-        session.mount('http://', adapter)
+        session = get_session_with_proxy(proxy, no_verify_ssl, dns_server, max_retries=max_retries)
+        if no_verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         if resume and os.path.exists(full_path):
             downloaded = os.path.getsize(full_path)
             headers['Range'] = f'bytes={downloaded}-'
 
-        with session.get(url, headers=headers, stream=True, timeout=timeout) as r:
+        with session.get(url, headers=headers, stream=True, timeout=timeout, verify=not no_verify_ssl) as r:
             if resume and r.status_code == 416:
                 print(f"[INFO] File {filename} sudah lengkap.")
                 return True
@@ -159,11 +311,15 @@ def download_video(url, headers, filename, output_dir, resume=False, timeout=30,
         return False
 
 # === Download Thumbnail ===
-def download_thumbnail(url, headers, filename, output_dir, timeout=30, proxy=None):
+def download_thumbnail(url, headers, filename, output_dir, timeout=30, proxy=None, no_verify_ssl=False, dns_server=None):
     full_path = os.path.join(output_dir, filename)
     try:
-        session = get_session_with_proxy(proxy)
-        with session.get(url, headers=headers, stream=True, timeout=timeout) as r:
+        session = get_session_with_proxy(proxy, no_verify_ssl, dns_server)
+        # Nonaktifkan peringatan SSL jika no_verify_ssl aktif
+        if no_verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        with session.get(url, headers=headers, stream=True, timeout=timeout, verify=not no_verify_ssl) as r:
             r.raise_for_status()
             with open(full_path, 'wb') as f:
                 for chunk in r.iter_content(1024):
@@ -233,16 +389,41 @@ def is_valid_xnxx_url(url):
         return False
 
 # === Pilih Resolusi Video ===
-def xnxx_scrape(url, timeout=30, proxy=None):
+def xnxx_scrape(url, timeout=30, proxy=None, no_verify_ssl=False, dns_server=None, debug=False):
     if not is_valid_xnxx_url(url):
         return {"status": 400, "message": "URL tidak valid atau bukan xnxx.com"}
 
+    # Gunakan User-Agent yang lebih umum dan modern
     ua = UserAgent(fallback="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     headers = {"User-Agent": ua.random}
+    # Tambahkan header umum lainnya yang mungkin membantu
+    headers.update({
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0'
+    })
 
     try:
-        session = get_session_with_proxy(proxy)
-        response = session.get(url, headers=headers, timeout=timeout)
+        session = get_session_with_proxy(proxy, no_verify_ssl, dns_server)
+        if no_verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        if debug:
+            print(f"[DEBUG] Mengakses URL: {url}")
+            print(f"[DEBUG] Menggunakan headers: {headers}")
+            print(f"[DEBUG] Timeout: {timeout}, Verify SSL: {not no_verify_ssl}, DNS: {dns_server}")
+
+        response = session.get(url, headers=headers, timeout=timeout, verify=not no_verify_ssl)
+
+        if debug:
+            print(f"[DEBUG] Status Code diterima: {response.status_code}")
+            print(f"[DEBUG] Content-Type: {response.headers.get('content-type', 'N/A')}")
+            print(f"[DEBUG] Sebagian respons HTML (500 karakter pertama):\n{response.text[:500]}\n...")
 
         if response.status_code != 200:
             return {"status": response.status_code, "message": f"Gagal mengakses URL: {response.reason}"}
@@ -250,52 +431,104 @@ def xnxx_scrape(url, timeout=30, proxy=None):
         html = response.text
         soup = BeautifulSoup(html, 'html.parser')
 
+        # --- Ekstrak Judul ---
         title = "Unknown Video"
-        title_tag = soup.find('meta', {'property': 'og:title'})
-        if title_tag:
-            title = title_tag['content'].strip()
-        else:
-            title_h1 = soup.find('h1', {'class': 'page-title'})
+        # Coba beberapa metode untuk mendapatkan judul
+        title_tag = soup.find('meta', property='og:title')
+        if not title_tag:
+             title_tag = soup.find('meta', attrs={'name': 'twitter:title'})
+        if not title_tag:
+            title_h1 = soup.find('h1', class_='page-title') # Sesuaikan class jika perlu
             if title_h1:
-                title = title_h1.get_text().strip()
+                title = title_h1.get_text(strip=True)
+        if title_tag:
+            title = title_tag.get('content', '').strip() or "Unknown Video"
 
+        # --- Ekstrak Gambar ---
         image = "N/A"
-        image_tag = soup.find('meta', {'property': 'og:image'})
+        image_tag = soup.find('meta', property='og:image')
+        if not image_tag:
+            image_tag = soup.find('meta', attrs={'name': 'twitter:image'})
         if image_tag:
-            image = image_tag['content']
-        else:
-            thumb_match = re.search(r'setThumbUrl\s*\(\s*[\'"]([^\'"]+)', html)
-            if thumb_match:
-                image = thumb_match.group(1)
+            image = image_tag.get('content', 'N/A')
+        # Fallback jika meta tidak ada
+        if image == "N/A":
+             thumb_match = re.search(r'setThumbUrl\s*\(\s*[\'"]([^\'"]+)', html)
+             if thumb_match:
+                 image = thumb_match.group(1)
 
-        video_files = {}
+        # --- Ekstrak URL Video ---
+        video_files = {'low': 'N/A', 'high': 'N/A', 'hls': 'N/A'}
 
         patterns = {
-            'low': [r'html5player\.setVideoUrlLow\s*\(\s*[\'"]([^\'"]+)', r'"low":[\s\r\n]*[\'"]([^\'"]+)'],
-            'high': [r'html5player\.setVideoUrlHigh\s*\(\s*[\'"]([^\'"]+)', r'"high":[\s\r\n]*[\'"]([^\'"]+)'],
-            'hls': [r'html5player\.setVideoHLS\s*\(\s*[\'"]([^\'"]+)', r'"hls":[\s\r\n]*[\'"]([^\'"]+)']
+            'low': [
+                r'html5player\.setVideoUrlLow\s*\(\s*["\']([^"\']+)["\']',
+                r'"low"\s*:\s*["\']([^"\']+)["\']',
+                r'low["\']\s*:\s*["\']([^"\']+)["\']',
+                r'video_url_low["\']?\s*[:=]\s*["\']([^"\']+)["\']'
+            ],
+            'high': [
+                r'html5player\.setVideoUrlHigh\s*\(\s*["\']([^"\']+)["\']',
+                r'"high"\s*:\s*["\']([^"\']+)["\']',
+                r'high["\']\s*:\s*["\']([^"\']+)["\']',
+                r'video_url["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                r'video_url_high["\']?\s*[:=]\s*["\']([^"\']+)["\']'
+            ],
+            'hls': [
+                r'html5player\.setVideoHLS\s*\(\s*["\']([^"\']+)["\']',
+                r'"hls"\s*:\s*["\']([^"\']+)["\']',
+                r'hls["\']\s*:\s*["\']([^"\']+)["\']',
+                r'm3u8_url["\']?\s*[:=]\s*["\']([^"\']+)["\']'
+            ]
         }
 
+        found_any = False
         for quality, pattern_list in patterns.items():
             for pattern in pattern_list:
-                match = re.search(pattern, html)
+                match = re.search(pattern, html, re.IGNORECASE)
                 if match:
-                    video_files[quality] = match.group(1)
-                    break
-            if quality not in video_files:
-                video_files[quality] = "N/A"
+                    potential_url = match.group(1)
+                    if potential_url.startswith(('http', '//')):
+                        video_files[quality] = potential_url
+                        found_any = True
+                        if debug:
+                            print(f"[DEBUG] Found {quality} URL: {potential_url}")
+                        break
+                elif debug:
+                    pass
 
-        if all(url == "N/A" for url in video_files.values()):
-            scripts = soup.find_all('script')
-            for script in scripts:
+        if not found_any:
+            script_tags = soup.find_all('script')
+            for script in script_tags:
                 if script.string:
                     script_content = script.string
-                    for quality, pattern_list in patterns.items():
-                        for pattern in pattern_list:
-                            match = re.search(pattern, script_content)
-                            if match and quality not in video_files:
-                                video_files[quality] = match.group(1)
+                    if 'html5player' in script_content or 'setVideo' in script_content:
+                        for quality, pattern_list in patterns.items():
+                            for pattern in pattern_list:
+                                match = re.search(pattern, script_content, re.IGNORECASE)
+                                if match:
+                                    potential_url = match.group(1)
+                                    if potential_url.startswith(('http', '//')):
+                                        video_files[quality] = potential_url
+                                        found_any = True
+                                        if debug:
+                                            print(f"[DEBUG] Found {quality} URL in script: {potential_url}")
+                                        break
+                            if video_files[quality] != "N/A":
                                 break
+                        if found_any:
+                            break
+
+        if not found_any:
+            return {
+                "status": 200,
+                "message": "URL video tidak ditemukan. Struktur HTML xnxx.com mungkin telah berubah.",
+                "data": {
+                    "title": title,
+                    "image": image,
+                    "files": video_files
+                }
+            }
 
         return {
             "status": 200,
@@ -308,69 +541,9 @@ def xnxx_scrape(url, timeout=30, proxy=None):
     except requests.exceptions.RequestException as e:
         return {"status": 503, "message": f"Network error: {e}"}
     except Exception as e:
-        return {"status": 500, "message": f"Kesalahan: {e}"}
-
-# === Fungsi Baru: Ambil Daftar Video dari Halaman Kategori/Pencarian ===
-def xnxx_search_videos(search_url, how_much=1, timeout=30, proxy=None):
-    """Mengambil daftar video dari halaman xnxx.com"""
-    if not is_valid_xnxx_url(search_url):
-        print(f"[ERROR] URL pencarian tidak valid: {search_url}")
-        return []
-
-    ua = UserAgent(fallback="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    headers = {"User-Agent": ua.random}
-    
-    print(f"[INFO] Mencari video di: {search_url}")
-    
-    try:
-        session = get_session_with_proxy(proxy)
-        response = session.get(search_url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        video_links = []
-        
-        # Cari semua link video berdasarkan class atau pola URL
-        video_elements = soup.find_all('div', class_='thumb-block')
-        
-        for elem in video_elements[:how_much]:
-            # Cari link video dalam elemen
-            link_elem = elem.find('a', href=re.compile(r'/video-'))
-            if link_elem and link_elem.get('href'):
-                full_url = urljoin("https://www.xnxx.com", link_elem['href'])
-                title_elem = elem.find('p', class_='title')
-                title = title_elem.get_text().strip() if title_elem else "Unknown Title"
-                video_links.append({
-                    'url': full_url,
-                    'title': title
-                })
-                
-        if not video_links:
-            # Coba metode alternatif: cari semua link yang mengandung /video-
-            all_links = soup.find_all('a', href=re.compile(r'/video-'))
-            seen_urls = set()
-            for link in all_links:
-                href = link.get('href')
-                if href and href not in seen_urls:
-                    seen_urls.add(href)
-                    full_url = urljoin("https://www.xnxx.com", href)
-                    title = link.get_text().strip() or "Unknown Title"
-                    video_links.append({
-                        'url': full_url,
-                        'title': title
-                    })
-                    if len(video_links) >= how_much:
-                        break
-        
-        print(f"[INFO] Ditemukan {len(video_links)} video.")
-        return video_links[:how_much]
-        
-    except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Gagal mengakses halaman pencarian: {str(e)}")
-        return []
-    except Exception as e:
-        print(f"[ERROR] Kesalahan saat mencari video: {str(e)}")
-        return []
+        import traceback
+        error_details = traceback.format_exc()
+        return {"status": 500, "message": f"Kesalahan: {e}\nDetails:\n{error_details}"}
 
 # === Batch Mode ===
 def process_batch_file(file_path, args):
@@ -425,8 +598,11 @@ def process_single_url(url, args):
         return
 
     print(f"[INFO] Memproses: {url}")
-    result = xnxx_scrape(url, timeout=args.timeout, proxy=args.proxy)
-    
+
+    dns_server = getattr(args, 'dns', None) if DNS_AVAILABLE else None
+    debug = getattr(args, 'debug', False)
+    result = xnxx_scrape(url, timeout=args.timeout, proxy=args.proxy, no_verify_ssl=args.no_verify_ssl, dns_server=dns_server, debug=debug)
+
     if result.get("status") != 200:
         print(f"[ERROR] Gagal memproses {url}: {result.get('message', 'Unknown error')}")
         return
@@ -466,7 +642,9 @@ def process_single_url(url, args):
             resume=args.resume,
             timeout=args.timeout,
             max_retries=args.max_retries,
-            proxy=args.proxy
+            proxy=args.proxy,
+            no_verify_ssl=args.no_verify_ssl,
+            dns_server=dns_server
         )
 
         if success:
@@ -489,55 +667,36 @@ def process_single_url(url, args):
             thumb_filename,
             args.output,
             timeout=args.timeout,
-            proxy=args.proxy
+            proxy=args.proxy,
+            no_verify_ssl=args.no_verify_ssl,
+            dns_server=dns_server
         )
 
 # === Main ===
+GITHUB_SCRIPT_URL = "https://raw.githubusercontent.com/Lilith-VnK/xnxx-downloader/refs/heads/main/start.py"
+LOCAL_SCRIPT_PATH = sys.argv[0]
+# Check update but ignore failures silently if network restricted
+try:
+    check_update(GITHUB_SCRIPT_URL, LOCAL_SCRIPT_PATH)
+except Exception:
+    pass
+
 def main():
     try:
         args = parse_args()
-        
+
         # Jika tidak ada argumen, tampilkan disclaimer dan help
         if len(sys.argv) == 1:
             show_disclaimer()
             parse_args().print_help()
             return
-            
+
         # Tampilkan disclaimer kecuali untuk help
         if not any(arg in sys.argv for arg in ['--help', '-h']):
             show_disclaimer()
 
-        # Mode auto-download dari halaman kategori/pencarian
-        if args.search_url:
-            if not is_valid_xnxx_url(args.search_url):
-                # Coba tambahkan https:// jika tidak ada
-                if not args.search_url.startswith(('http://', 'https://')):
-                    args.search_url = "https://www." + args.search_url
-                else:
-                    args.search_url = "https://www.xnxx.com"
-                    
-            video_list = xnxx_search_videos(
-                args.search_url, 
-                how_much=args.how_much,
-                timeout=args.timeout,
-                proxy=args.proxy
-            )
-            
-            if not video_list:
-                print("[INFO] Tidak ada video ditemukan.")
-                return
-                
-            print(f"[INFO] Mengunduh {len(video_list)} video...")
-            for i, video_info in enumerate(video_list, 1):
-                print(f"\n[INFO] Memproses video {i}/{len(video_list)}: {video_info['title']}")
-                print(f"       URL: {video_info['url']}")
-                process_single_url(video_info['url'], args)
-                if args.delay > 0 and i < len(video_list):
-                    print(f"[INFO] Menunggu {args.delay} detik...")
-                    time.sleep(args.delay)
-                    
         # Mode batch file
-        elif args.batch:
+        if args.batch:
             process_batch_file(args.batch, args)
         # Mode URL tunggal
         elif args.url:
