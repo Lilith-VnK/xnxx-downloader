@@ -9,6 +9,7 @@ Downloader skrip berbasis Python untuk mengunduh video dari situs xnxx.com denga
 ## ✅ Fitur Utama
 
 - **Auto Update**: Skrip akan memeriksa dan mengunduh versi terbaru secara otomatis.
+- **DNS Changer**: Skrip akan mengubah DNS untuk menghindari pemblokiran oleh ISP
 - **Resume Download**: Mendukung lanjutkan unduhan yang terputus.
 - **Pilih Kualitas Video**: Pilih antara `low`, `high`, atau `hls`.
 - **Batch Mode**: Unduh beberapa video sekaligus dari file teks.
@@ -23,7 +24,7 @@ Downloader skrip berbasis Python untuk mengunduh video dari situs xnxx.com denga
 Pastikan Anda telah menginstal Python dan library berikut:
 
 ```bash
-pip install requests beautifulsoup4 fake-useragent tqdm argparse
+pip install requests beautifulsoup4 fake-useragent tqdm argparse dnspython
 ```
 
 ### Tambahan (Opsional):
@@ -46,12 +47,12 @@ pip install requests beautifulsoup4 fake-useragent tqdm argparse
 ### 🔹 Dasar
 
 ```bash
-python xnxx.py [URL] --download
+python start.py [URL] --download
 ```
 
 **Contoh**:
 ```bash
-python xnxx.py https://www.xnxx.com/video-123456789/987654321 --download
+python start.py https://www.xnxx.com/video-123456789/987654321 --download
 ```
 
 ## 🔹 Advanced Usage
@@ -75,10 +76,10 @@ python xnxx.py https://www.xnxx.com/video-123456789/ --download --quality high -
 ## 📁 Batch Mode
 
 Buat file teks dengan daftar URL, misalnya `urls.txt`:
-```
 
 https://www.xnxx.com/video-123456789/
 https://www.xnxx.com/video-987654321/
+```
 
 Lalu jalankan:
 
@@ -90,6 +91,16 @@ python start.py --batch urls.txt --download --output downloads --delay 5
 
 Jika kalian mengalami positif network/terblokir oleh ISP anda, gunakan perintah
 
+```bash
+--dns 1.1.1.1
+```
+
+Atau 
+```bash
+--dns 8.8.8.8
+```
+
+Contoh penggunaan 
 ```bash
 python3 start.py https://xnxx.com/111111/example --download --dns 1.1.1.1
 ```
